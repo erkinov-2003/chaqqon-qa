@@ -1,0 +1,74 @@
+name: Android smoke test
+
+# Runs on its own when a release with an APK is published,
+# or by hand from the Actions tab (empty tag = latest release).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag that holds the APK (empty = latest)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The repo is public, so the APK sits in the release encrypted;
+      # the key is the APK_PASSWORD secret.
+      - name: Download and decrypt the x86_64 APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          APK_PASSWORD: ${{ secrets.APK_PASSWORD }}
+        run: |
+          mkdir -p apk
+          gh release download $TAG --repo "$GITHUB_REPOSITORY" --pattern '*x86_64*.apk.enc' --dir apk
+          for f in apk/*.enc; do
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in "$f" -out "${f%.enc}" -pass env:APK_PASSWORD
+            rm "$f"
+          done
+          ls -la apk
+
+      - name: Boot emulator, install, launch
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: bash scripts/smoke.sh
+
+      # Artifacts of a public repo are downloadable by anyone, and logcat can
+      # carry tokens — the bundle goes up encrypted with the same key.
+      - name: Encrypt screenshots and logs
+        if: always()
+        env:
+          APK_PASSWORD: ${{ secrets.APK_PASSWORD }}
+        run: |
+          mkdir -p out
+          tar czf - out | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -out smoke-results.tar.gz.enc -pass env:APK_PASSWORD
+
+      - name: Upload encrypted results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results
+          path: smoke-results.tar.gz.enc
+          retention-days: 7
